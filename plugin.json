@@ -4,5 +4,6 @@
   "common_name": "My Save",
   "description": "Adds Steam save and config folder shortcuts to Steam game pages",
   "version": "1.3.9",
+  "author": "Yecgaa01",
   "backendType": "lua"
 }

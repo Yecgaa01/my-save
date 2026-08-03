@@ -56,13 +56,24 @@ local function read_file(path)
     return content
 end
 
+local function native_safe_path(path)
+    local value = normalize_slashes(trim(path))
+    if value == "" then return false end
+    if #value > 1000 then return false end
+    if value:find("%z") or value:find('"', 1, true) or value:find("*", 1, true) or value:find("?", 1, true) then return false end
+    if value:find("<[^>]+>") or value:find("%%[%w_]+%%") then return false end
+    if value:find("|", 1, true) or value:find(">", 1, true) or value:find("<", 1, true) then return false end
+    return value:match("^%a:[\\/]") ~= nil or value:match("^[\\/][\\/][^\\/]+[\\/][^\\/]+") ~= nil
+end
+
 local function exists(path)
-    if not path or path == "" then return false end
+    if not native_safe_path(path) then return false end
     local ok, result = pcall(fs.exists, path)
     return ok and result == true
 end
 
 local function list_dir(path)
+    if not native_safe_path(path) then return {} end
     local ok, entries = pcall(fs.list, path)
     if ok and type(entries) == "table" then return entries end
     return {}
@@ -285,9 +296,22 @@ end
 local function account_from_loginusers(steam_root)
     local content = read_file(normalize_slashes(steam_root) .. "\\config\\loginusers.vdf")
     if not content then return nil end
-    for steam64, block in content:gmatch('"(%d+)"%s*%{(.-)%}') do
-        if block:find('"MostRecent"%s*"1"') then return steam64_to_account_id(steam64) end
+    local current = nil
+    local current_recent = false
+    local fallback = nil
+    for line in content:gmatch("[^\r\n]+") do
+        local steam64 = line:match('^%s*"(7656119%d+)"%s*$')
+        if steam64 then
+            if current and current_recent then return steam64_to_account_id(current) end
+            if not fallback then fallback = steam64 end
+            current = steam64
+            current_recent = false
+        elseif current then
+            if line:match('"MostRecent"%s*"1"') then current_recent = true end
+        end
     end
+    if current and current_recent then return steam64_to_account_id(current) end
+    if fallback then return steam64_to_account_id(fallback) end
     return nil
 end
 
@@ -302,11 +326,16 @@ end
 
 function M.resolve_account_id(steam_root, provided)
     steam_root = normalize_slashes(steam_root or M.steam_root())
+    provided = trim(provided)
+    if is_numeric(provided) and provided ~= "" then
+        local account = provided:match("^7656119%d%d%d%d%d%d%d%d%d%d$") and steam64_to_account_id(provided) or provided
+        if account and account ~= "" and exists(steam_root .. "\\userdata\\" .. account) then return account end
+        if not provided:match("^7656119%d%d%d%d%d%d%d%d%d%d$") and exists(steam_root .. "\\userdata\\" .. provided) then return provided end
+    end
+
     local recent = account_from_loginusers(steam_root)
     if recent and recent ~= "" and exists(steam_root .. "\\userdata\\" .. recent) then return recent end
 
-    provided = trim(provided)
-    if is_numeric(provided) and provided ~= "" and exists(steam_root .. "\\userdata\\" .. provided) then return provided end
     local ids = list_numeric_userdata(steam_root)
     if #ids == 1 then return ids[1] end
     return recent or ""
@@ -849,6 +878,37 @@ function M.userdata_app_dirs(steam_root, app_id, account_id)
     return result
 end
 
+local function store_user_id_variants(raw_path, context)
+    local result = {}
+    local value = tostring(raw_path or "")
+    if not value:find("<[Ss]tore[Uu]ser[Ii]d>") then return result end
+    context = context or {}
+    local account_id = trim(context.account_id)
+    if account_id == "" then return result end
+    local steam64 = account_id:match("^7656119%d%d%d%d%d%d%d%d%d%d$") and account_id or M.account_id_to_steam64(account_id)
+    local account = account_id:match("^7656119%d%d%d%d%d%d%d%d%d%d$") and M.steam64_to_account_id(account_id) or account_id
+    local seen = {}
+    local function add(kind)
+        local copy = {}
+        for key, child in pairs(context) do copy[key] = child end
+        copy.store_user_id_kind = kind
+        local expanded = M.expand(value, copy)
+        local key = expanded:lower()
+        if expanded ~= "" and not seen[key] then
+            seen[key] = true
+            table.insert(result, expanded)
+        end
+    end
+    if context.store_user_id_kind == "steam64" then
+        if steam64 ~= "" then add("steam64") end
+        if account ~= "" then add("account") end
+    else
+        if account ~= "" then add("account") end
+        if steam64 ~= "" then add("steam64") end
+    end
+    return result
+end
+
 function M.resolve_candidates(raw_path, context)
     local result = {}
     local seen = {}
@@ -864,6 +924,11 @@ function M.resolve_candidates(raw_path, context)
         return result
     end
 
+    for _, variant in ipairs(store_user_id_variants(raw_path, context)) do
+        for _, candidate in ipairs(wildcard_candidates(variant)) do append_unique(result, seen, candidate) end
+        for _, candidate in ipairs(variable_leaf_candidates(variant)) do append_unique(result, seen, candidate) end
+        append_unique(result, seen, variant)
+    end
     for _, candidate in ipairs(wildcard_candidates(expanded)) do append_unique(result, seen, candidate) end
     for _, candidate in ipairs(launcher_user_candidates(expanded)) do append_unique(result, seen, candidate) end
     for _, candidate in ipairs(variable_leaf_candidates(expanded)) do append_unique(result, seen, candidate) end

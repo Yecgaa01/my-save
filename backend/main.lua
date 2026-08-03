@@ -139,10 +139,28 @@ local function ensure_dir(path)
     return wait_for_path(path, true)
 end
 
-local function backup_game_folder(root, app_id, game_name)
+local function backup_game_folder(root, app_id, game_name, user_id)
+    local id = tostring(app_id or "")
+    local name = sanitize_backup_name((id ~= "" and (id .. " - ") or "") .. tostring(game_name or "Game"))
+    local user = sanitize_backup_name(tostring(user_id or ""))
+    if user == "" then user = "unknown-user" end
+    return root:gsub("[\\/]+$", "") .. "\\" .. user .. "\\" .. name
+end
+
+local function backup_legacy_game_folder(root, app_id, game_name)
     local id = tostring(app_id or "")
     local name = sanitize_backup_name((id ~= "" and (id .. " - ") or "") .. tostring(game_name or "Game"))
     return root:gsub("[\\/]+$", "") .. "\\" .. name
+end
+
+local function backup_user_id_from_args(args)
+    args = args or {}
+    local steam_root = paths.steam_root()
+    local provided_account = trim(args.steam_account_id or args.steamAccountId or args.accountId or args.account_id or "")
+    local provided_steam64 = trim(args.steam_id64 or args.steamId64 or args.steamID64 or args.steam_id or args.steamId or "")
+    local account = paths.resolve_account_id(steam_root, provided_account ~= "" and provided_account or provided_steam64)
+    if account == "" and provided_steam64 ~= "" then account = paths.steam64_to_account_id(provided_steam64) end
+    return account ~= "" and account or "unknown-user"
 end
 
 local function backup_metadata_path(path)
@@ -646,6 +664,16 @@ local function ls_install_dir_fallback(raw_path, context)
     return "", false
 end
 
+local function ls_wildcard_file_parent(raw_path, path)
+    local raw = tostring(raw_path or "")
+    if not raw:find("*", 1, true) then return "" end
+    local value = tostring(path or ""):gsub("[\\/]+", "\\"):gsub("\\+$", "")
+    if value == "" then return "" end
+    local parent = value:match("^(.*)\\[^\\]+$") or ""
+    if parent ~= "" and paths.exists(parent) and folder_has_meaningful_save_content(parent) then return parent end
+    return ""
+end
+
 local function ls_install_dir_file_parent(raw_path, path, context)
     if not is_ls_install_dir_path(raw_path) then return "" end
     local value = tostring(path or ""):gsub("[\\/]+", "\\"):gsub("\\+$", "")
@@ -785,6 +813,14 @@ local function add_item(items, seen, kind, label, raw_path, context, options)
         end
 
         if options.source == "ls" and kind == "save" then
+            local wildcard_parent = ls_wildcard_file_parent(raw_path, open_path ~= "" and open_path or chosen)
+            if wildcard_parent ~= "" then
+                chosen = wildcard_parent
+                open_path = wildcard_parent
+                chosen_exists = true
+                partial = false
+                label = "Save folder"
+            end
             local parent = ls_install_dir_file_parent(raw_path, open_path ~= "" and open_path or chosen, context)
             if parent ~= "" then
                 chosen = parent
@@ -1744,6 +1780,7 @@ function GetSaveFolders(app_id, fallback_name, steam_account_id, force_remote)
             end
         end
         if app_id == "" then return safe_encode({ success = false, error = "Missing AppID", items = {} }) end
+        local backup_user_id = backup_user_id_from_args({ steam_account_id = steam_account_id, steam_id64 = steam_id64 })
         if backup_command == "preview_restore" or backup_command == "restore_backup" then
             local root = backup_root(load_settings())
             if root == "" then return safe_encode({ success = false, error = "Choose a backup folder first", items = {} }) end
@@ -1756,7 +1793,7 @@ function GetSaveFolders(app_id, fallback_name, steam_account_id, force_remote)
             end
             local backup_save_folder = backup_restore_path:gsub("[\\/]+$", "") .. "\\Save folder"
             if not paths.exists(backup_save_folder) then return safe_encode({ success = false, error = "Selected backup has no Save folder", items = {} }) end
-            local game_backup_folder = backup_game_folder(root, app_id, fallback_name ~= "" and fallback_name or "Game")
+            local game_backup_folder = backup_game_folder(root, app_id, fallback_name ~= "" and fallback_name or "Game", backup_user_id)
             local pre_restore = game_backup_folder .. "\\pre-restore-" .. timestamp_name()
             if backup_command == "preview_restore" then
                 return safe_encode({ success = true, backupCommand = backup_command, appId = app_id, selectedBackupPath = backup_restore_path, backupSaveFolder = backup_save_folder, currentSavePath = backup_source_path, preRestorePath = pre_restore, items = {} })
@@ -1764,7 +1801,7 @@ function GetSaveFolders(app_id, fallback_name, steam_account_id, force_remote)
             if not ensure_dir(pre_restore) then return safe_encode({ success = false, error = "Unable to create pre-restore backup", items = {} }) end
             local pre_ok, pre_err = copy_folder(backup_source_path, pre_restore)
             if not pre_ok then return safe_encode({ success = false, error = pre_err or "Unable to create pre-restore backup", preRestorePath = pre_restore, items = {} }) end
-            write_backup_metadata(pre_restore, { appId = app_id, gameName = fallback_name ~= "" and fallback_name or "Game", createdAt = timestamp_name(), sourcePath = backup_source_path, preRestore = true })
+            write_backup_metadata(pre_restore, { appId = app_id, gameName = fallback_name ~= "" and fallback_name or "Game", accountId = backup_user_id, createdAt = timestamp_name(), sourcePath = backup_source_path, preRestore = true })
             local restore_ok, restore_err = copy_folder(backup_save_folder, backup_source_path)
             if not restore_ok then return safe_encode({ success = false, error = restore_err or "Restore failed", preRestorePath = pre_restore, items = {} }) end
             logger:info("GetSaveFolders restore_backup app_id=" .. app_id .. ", backup=" .. backup_restore_path .. ", target=" .. backup_source_path .. ", pre=" .. pre_restore)
@@ -1773,18 +1810,23 @@ function GetSaveFolders(app_id, fallback_name, steam_account_id, force_remote)
         if backup_command == "list_backups" then
             local root = backup_root(load_settings())
             if root == "" then return safe_encode({ success = false, error = "Choose a backup folder first", backups = {}, items = {} }) end
-            local folder = backup_game_folder(root, app_id, fallback_name ~= "" and fallback_name or "Game")
+            local folder = backup_game_folder(root, app_id, fallback_name ~= "" and fallback_name or "Game", backup_user_id)
+            local legacy_folder = backup_legacy_game_folder(root, app_id, fallback_name ~= "" and fallback_name or "Game")
             local backups = {}
-            for _, child in ipairs(paths.children(folder)) do
-                if paths.exists(child) then
-                    local backup_save_folder = tostring(child):gsub("[\\/]+$", "") .. "\\Save folder"
-                    if paths.exists(backup_save_folder) then
-                        local name = tostring(child):match("([^\\/]+)$") or child
-                        local meta = read_backup_metadata(child)
-                        table.insert(backups, { label = snapshot_label_from_name(meta.createdAt or name), gameFolder = tostring(folder):match("([^\\/]+)$") or tostring(folder), path = child, createdAt = meta.createdAt or name, sourcePath = meta.sourcePath or "" })
+            local function collect_backups(folder_to_scan, legacy)
+                for _, child in ipairs(paths.children(folder_to_scan)) do
+                    if paths.exists(child) then
+                        local backup_save_folder = tostring(child):gsub("[\\/]+$", "") .. "\\Save folder"
+                        if paths.exists(backup_save_folder) then
+                            local name = tostring(child):match("([^\\/]+)$") or child
+                            local meta = read_backup_metadata(child)
+                            table.insert(backups, { label = snapshot_label_from_name(meta.createdAt or name), gameFolder = tostring(folder_to_scan):match("([^\\/]+)$") or tostring(folder_to_scan), path = child, createdAt = meta.createdAt or name, sourcePath = meta.sourcePath or "", legacy = legacy == true })
+                        end
                     end
                 end
             end
+            collect_backups(folder, false)
+            if legacy_folder:lower() ~= folder:lower() then collect_backups(legacy_folder, true) end
             table.sort(backups, function(a, b) return tostring(a.createdAt or "") > tostring(b.createdAt or "") end)
             return safe_encode({ success = true, backupCommand = backup_command, appId = app_id, backupRoot = folder, backups = backups, items = {} })
         end
@@ -1792,7 +1834,7 @@ function GetSaveFolders(app_id, fallback_name, steam_account_id, force_remote)
             local settings = load_settings()
             local root = backup_root(settings)
             if root == "" then return safe_encode({ success = false, error = "Choose a backup folder first" }) end
-            local base_folder = backup_game_folder(root, app_id, fallback_name ~= "" and fallback_name or "Game")
+            local base_folder = backup_game_folder(root, app_id, fallback_name ~= "" and fallback_name or "Game", backup_user_id)
             clean_pre_restore_backups(base_folder)
             local allow = backup_command ~= "create_current"
             local folder = allow == false and (base_folder .. "\\Current") or unique_path(base_folder .. "\\" .. timestamp_name())
@@ -1806,7 +1848,7 @@ function GetSaveFolders(app_id, fallback_name, steam_account_id, force_remote)
             local target = folder .. "\\Save folder"
             local copied, copy_err = copy_folder(backup_source_path, target)
             if not copied then return safe_encode({ success = false, error = copy_err or "Copy failed", backupPath = folder }) end
-            write_backup_metadata(folder, { appId = app_id, gameName = fallback_name ~= "" and fallback_name or "Game", createdAt = created_at, phase = "copied-recursive", sourcePath = backup_source_path, targetPath = target })
+            write_backup_metadata(folder, { appId = app_id, gameName = fallback_name ~= "" and fallback_name or "Game", accountId = backup_user_id, createdAt = created_at, phase = "copied-recursive", sourcePath = backup_source_path, targetPath = target })
             local source_file = io.open(folder .. "\\source-path.txt", "w")
             if source_file then
                 source_file:write(backup_source_path)
@@ -1821,8 +1863,10 @@ function GetSaveFolders(app_id, fallback_name, steam_account_id, force_remote)
         if steam_id64 == "" then steam_id64 = paths.account_id_to_steam64(account_id) end
         local game_dir = paths.game_install_dir(steam_root, app_id)
         local game_folder = tostring(game_dir or ""):match("([^\\]+)$") or ""
-        local context = { steam_root = steam_root, account_id = account_id, steam_id64 = steam_id64, app_id = app_id, game_folder = game_folder, game_name = fallback_name, rockstar_id = rockstar_id or "", ubisoft_id = ubisoft_id or "" }
+        local context = { steam_root = steam_root, account_id = account_id, steam_id64 = steam_id64, store_user_id_kind = steam_id64 ~= "" and "steam64" or "account", app_id = app_id, game_folder = game_folder, game_name = fallback_name, rockstar_id = rockstar_id or "", ubisoft_id = ubisoft_id or "" }
+        logger:info("GetSaveFolders steam ids provided_account=" .. tostring(steam_account_id or "") .. ", provided_steam64=" .. tostring(steam_id64 or "") .. ", account=" .. tostring(account_id or "") .. ", store_kind=" .. tostring(context.store_user_id_kind or ""))
         logger:info("GetSaveFolders launcher ids rockstar=" .. tostring(rockstar_id or "") .. ", ubisoft=" .. tostring(ubisoft_id or ""))
+        logger:info("GetSaveFolders stage=pcgw-local start")
         local data = nil
         local pcgw_ok, pcgw_result = pcall(function()
             return pcgw.lookup(app_id, fallback_name, { remote = false })
@@ -1834,10 +1878,12 @@ function GetSaveFolders(app_id, fallback_name, steam_account_id, force_remote)
             logger:error(reason)
             data = { found = false, source = "pcgw-error", reason = reason, saves = {}, configs = {} }
         end
+        logger:info("GetSaveFolders stage=pcgw-local done source=" .. tostring(data and data.source or ""))
         local items = {}
         local seen = {}
         local local_count = 0
         local_count = local_count + add_ls_manifest_items(items, seen, context)
+        logger:info("GetSaveFolders stage=ls-manifest done count=" .. tostring(local_count))
 
         local likely_ubisoft_game = should_add_ubisoft_savegames({ saves = {}, configs = {} }, context)
         local likely_rockstar_game = tostring(fallback_name or ""):lower():find("red dead", 1, true) ~= nil
@@ -2272,7 +2318,8 @@ function CreateBackupFolderPreview(args)
         if app_id == "" then return safe_encode({ success = false, error = "Missing app ID" }) end
         local root = backup_root(load_settings())
         if root == "" then return safe_encode({ success = false, error = "Choose a backup folder first" }) end
-        local folder = backup_game_folder(root, app_id, "Game") .. "\\" .. timestamp_name()
+        local user_id = backup_user_id_from_args(args)
+        local folder = backup_game_folder(root, app_id, "Game", user_id) .. "\\" .. timestamp_name()
         folder = unique_path(folder)
         if not ensure_dir(folder) then return safe_encode({ success = false, error = "Unable to create backup folder" }) end
         logger:info("CreateBackupFolderPreview app_id=" .. app_id .. ", path=" .. folder)
@@ -2293,7 +2340,8 @@ function BackupCurrentSave(args)
         local settings = load_settings()
         local root = backup_root(settings)
         if root == "" then return safe_encode({ success = false, error = "Unable to find a backup root folder" }) end
-        local game_folder = backup_game_folder(root, app_id, game_name)
+        local user_id = backup_user_id_from_args(args)
+        local game_folder = backup_game_folder(root, app_id, game_name, user_id)
         local allow = settings.allowMultipleBackups
         if allow == nil then allow = true end
         local created_at = timestamp_name()
@@ -2303,7 +2351,7 @@ function BackupCurrentSave(args)
         if not ensure_dir(destination) then return safe_encode({ success = false, error = "Unable to create backup folder" }) end
         local ok, copy_err = copy_folder(source, destination)
         if not ok then return safe_encode({ success = false, error = copy_err or "Copy failed" }) end
-        write_backup_metadata(destination, { appId = app_id, gameName = game_name, createdAt = created_at, sourcePath = original_source, backupSourcePath = source, label = tostring(item.label or "Save folder") })
+        write_backup_metadata(destination, { appId = app_id, gameName = game_name, accountId = user_id, createdAt = created_at, sourcePath = original_source, backupSourcePath = source, label = tostring(item.label or "Save folder") })
         logger:info("BackupCurrentSave app_id=" .. app_id .. ", path=" .. destination)
         return safe_encode({ success = true, appId = app_id, gameName = game_name, backupPath = destination, createdAt = created_at })
     end)
@@ -2319,15 +2367,21 @@ function ListSaveBackups(args)
         if type(args[1]) == "string" and args[1] ~= "" then args = decode_arg_table(args[1]) end
         local app_id = tostring(args.app_id or args.appId or "")
         local game_name = tostring(args.gameName or args.game_name or "Game")
-        local folder = backup_game_folder(backup_root(load_settings()), app_id, game_name)
+        local user_id = backup_user_id_from_args(args)
+        local folder = backup_game_folder(backup_root(load_settings()), app_id, game_name, user_id)
+        local legacy_folder = backup_legacy_game_folder(backup_root(load_settings()), app_id, game_name)
         local backups = {}
-        for _, child in ipairs(paths.children(folder)) do
-            if paths.exists(child) then
-                local name = tostring(child):match("([^\\/]+)$") or child
-                local meta = read_backup_metadata(child)
-                table.insert(backups, { label = snapshot_label_from_name(meta.createdAt or name), path = child, createdAt = meta.createdAt or name })
+        local function collect_backups(folder_to_scan, legacy)
+            for _, child in ipairs(paths.children(folder_to_scan)) do
+                if paths.exists(child) then
+                    local name = tostring(child):match("([^\\/]+)$") or child
+                    local meta = read_backup_metadata(child)
+                    table.insert(backups, { label = snapshot_label_from_name(meta.createdAt or name), path = child, createdAt = meta.createdAt or name, legacy = legacy == true })
+                end
             end
         end
+        collect_backups(folder, false)
+        if legacy_folder:lower() ~= folder:lower() then collect_backups(legacy_folder, true) end
         table.sort(backups, function(a, b) return tostring(a.createdAt or "") > tostring(b.createdAt or "") end)
         return safe_encode({ success = true, backupRoot = folder, backups = backups })
     end)
@@ -2347,11 +2401,12 @@ function RestoreSaveBackup(args)
         end
         local app_id = tostring(args.app_id or args.appId or "")
         local game_name = tostring(args.gameName or args.game_name or "Game")
-        local pre_restore = backup_game_folder(backup_root(load_settings()), app_id, game_name) .. "\\pre-restore-" .. timestamp_name()
+        local user_id = backup_user_id_from_args(args)
+        local pre_restore = backup_game_folder(backup_root(load_settings()), app_id, game_name, user_id) .. "\\pre-restore-" .. timestamp_name()
         if not ensure_dir(pre_restore) then return safe_encode({ success = false, error = "Unable to create pre-restore backup" }) end
         local pre_ok, pre_err = copy_folder(target, pre_restore)
         if not pre_ok then return safe_encode({ success = false, error = pre_err or "Unable to create pre-restore backup" }) end
-        write_backup_metadata(pre_restore, { appId = app_id, gameName = game_name, createdAt = timestamp_name(), sourcePath = target, preRestore = true })
+        write_backup_metadata(pre_restore, { appId = app_id, gameName = game_name, accountId = user_id, createdAt = timestamp_name(), sourcePath = target, preRestore = true })
         local ok, copy_err = copy_folder(backup_path, target)
         if not ok then return safe_encode({ success = false, error = copy_err or "Restore failed", preRestoreBackupPath = pre_restore }) end
         logger:info("RestoreSaveBackup app_id=" .. app_id .. ", restored=" .. backup_path .. ", target=" .. target)
@@ -2369,7 +2424,8 @@ function ChooseBackupFolder(args)
             if app_id == "" then return safe_encode({ success = false, error = "Missing app ID" }) end
             local root = backup_root(load_settings())
             if root == "" then return safe_encode({ success = false, error = "Choose a backup folder first" }) end
-            local folder = unique_path(backup_game_folder(root, app_id, "Game") .. "\\" .. timestamp_name())
+            local user_id = backup_user_id_from_args(args)
+            local folder = unique_path(backup_game_folder(root, app_id, "Game", user_id) .. "\\" .. timestamp_name())
             if not ensure_dir(folder) then return safe_encode({ success = false, error = "Unable to create backup folder" }) end
             logger:info("ChooseBackupFolder create preview app_id=" .. app_id .. ", path=" .. folder)
             return safe_encode({ success = true, backupPath = folder, createdAt = timestamp_name() })
